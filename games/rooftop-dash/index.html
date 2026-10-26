@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Rooftop Dash</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0420; }
+  body { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0"></canvas>
+<script>
+/* Rooftop Dash: an original endless runner across a neon city at night,
+   for the Insert Coin arcade. All art and sound are generated at runtime. */
+(() => {
+'use strict';
+
+// ---------- SDK guard ----------
+const IC = window.InsertCoin || { standalone: true, muted: false, ready() {}, gameOver() {}, submitScore() {}, on() {} };
+
+// ---------- helpers ----------
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a, b) => a + Math.random() * (b - a);
+const FONT = 'ui-rounded, system-ui, -apple-system, "Segoe UI", sans-serif';
+const coarse = matchMedia('(pointer: coarse)').matches;
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const COVER = location.hash === '#cover'; // dev only: AI runs with the HUD on, for the card cover
+function rrect(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+// small seeded generator so the skyline strips are stable between resizes
+function seeded(s) { return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
+
+const C = {
+  violet: '#9b5cff', pink: '#ff4fa3', teal: '#2ff3d2', white: '#f6efff', amber: '#ffc46b',
+  dim: 'rgba(235,220,255,.62)', roof: '#140a28', ledge: '#2a1850',
+};
+
+// ---------- audio ----------
+let actx = null, master = null, muted = !!IC.muted, sfxOn = false, noiseBuf = null;
+function audio() {
+  try {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      actx = new AC();
+      master = actx.createGain(); master.gain.value = muted ? 0 : 0.45; master.connect(actx.destination);
+      noiseBuf = actx.createBuffer(1, actx.sampleRate * 0.6, actx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (actx.state === 'suspended') actx.resume();
+  } catch (e) { /* audio is optional */ }
+}
+function setMuted(m) { muted = !!m; if (master) master.gain.setTargetAtTime(muted ? 0 : 0.45, actx.currentTime, 0.02); }
+function tone(f, d, type = 'square', v = 0.1, f2 = 0, delay = 0) {
+  if (!actx || muted || !sfxOn) return;
+  const t = actx.currentTime + delay, o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + d);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + d + 0.03);
+}
+function noise(d, v = 0.1, freq = 1200, q = 0.7, f2 = 0) {
+  if (!actx || muted || !sfxOn) return;
+  const t = actx.currentTime, s = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+  s.buffer = noiseBuf; f.type = 'bandpass'; f.frequency.setValueAtTime(freq, t); f.Q.value = q;
+  if (f2) f.frequency.exponentialRampToValueAtTime(f2, t + d);
+  g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t); s.stop(t + d + 0.03);
+}
+let coinStreak = 0, coinStreakT = 0;
+const sfx = {
+  jump: () => tone(280, 0.16, 'square', 0.07, 560),
+  djump: () => { tone(420, 0.16, 'square', 0.06, 900); tone(840, 0.12, 'sine', 0.04, 1300); },
+  land: () => noise(0.08, 0.1, 400, 0.8),
+  slide: () => noise(0.3, 0.07, 2500, 0.6, 600),
+  coin: () => { // climbs a scale while you keep collecting
+    const st = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24][Math.min(coinStreak, 10)];
+    const f = 880 * Math.pow(2, st / 12);
+    tone(f, 0.08, 'sine', 0.07); tone(f * 1.5, 0.12, 'sine', 0.05, 0, 0.05);
+  },
+  crash: () => { noise(0.5, 0.2, 900, 0.5, 120); tone(220, 0.5, 'sawtooth', 0.08, 50); },
+  mile: () => { [0, 7, 12].forEach((s, i) => tone(523 * Math.pow(2, s / 12), 0.14, 'triangle', 0.07, 0, i * 0.07)); },
+  over: () => { [7, 3, 0, -5].forEach((s, i) => tone(330 * Math.pow(2, s / 12), 0.28, 'triangle', 0.08, 0, i * 0.15)); },
+};
+
+// ---------- view ----------
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let vw = 0, vh = 0, dpr = 1, k = 1, viewW = 960, viewH = 540, hs = 1;
+let ANCH = 0.64, winPattern = null, strips = [], stars = [];
+
+function layout() {
+  vw = innerWidth; vh = innerHeight;
+  dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  cv.width = Math.round(vw * dpr); cv.height = Math.round(vh * dpr);
+  // 16:9 shows 960x540 world units; narrow screens zoom out so ~620 units of runway stay visible
+  k = Math.min(vh / 540, vw / 620);
+  viewW = vw / k; viewH = vh / k;
+  ANCH = vh > vw ? 0.6 : 0.64;               // where the rooftop line sits on screen
+  hs = clamp(Math.min(vw / 640, vh / 400), 0.62, 1.7);   // HUD scale in CSS px
+  buildArt();
+}
+
+// pre-rendered art: a window tile for rooftops and two skyline strips
+function buildArt() {
+  const px = k * dpr;
+  const T = 192, tile = document.createElement('canvas');
+  tile.width = tile.height = Math.max(8, Math.round(T * px));
+  const t = tile.getContext('2d'), r = seeded(7);
+  t.scale(px, px);
+  for (let cy = 0; cy < 8; cy++) {
+    const floorLit = r() < 0.25;                       // some floors glow end to end
+    for (let cx = 0; cx < 8; cx++) {
+      const lit = floorLit ? r() < 0.8 : r() < 0.22;
+      t.fillStyle = lit ? [C.amber, C.pink, C.teal, '#ffe3a8'][(r() * 4) | 0] : 'rgba(90,70,150,.22)';
+      t.globalAlpha = lit ? 0.3 + r() * 0.45 : 1;
+      t.fillRect(cx * 24 + 7, cy * 24 + 6, 10, 12);
+    }
+  }
+  winPattern = ctx.createPattern(tile, 'repeat');
+  if (winPattern.setTransform) winPattern.setTransform(new DOMMatrix().scale(1 / px));
+
+  strips = [
+    makeStrip(1600, 300, '#2b1150', 0.12, 120, 280, 11, 0.25),
+    makeStrip(1400, 260, '#1b0a35', 0.32, 80, 230, 23, 0.45),
+  ];
+  const rs = seeded(3);
+  stars = Array.from({ length: 150 }, () => ({ x: rs(), y: rs(), s: rs() * 1.6 + 0.4, p: rs() * 6 }));
+}
+function makeStrip(W, H, color, factor, minH, maxH, seed, lit) {
+  const px = k * dpr, c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * px)); c.height = Math.max(1, Math.round(H * px));
+  const g = c.getContext('2d'), r = seeded(seed);
+  g.scale(px, px);
+  let x = 0;
+  while (x < W) {
+    const w = 40 + r() * 90, h = minH + r() * (maxH - minH), top = H - h;
+    g.fillStyle = color;
+    g.fillRect(x, top, w, h + 2);
+    if (r() < 0.4) g.fillRect(x + w * 0.25, top - 14, w * 0.5, 14);       // tiered roof
+    if (r() < 0.35) { g.fillRect(x + w * 0.6, top - 40, 2, 40); }         // antenna
+    for (let wx = x + 6; wx < x + w - 6; wx += 9) for (let wy = top + 8; wy < H - 6; wy += 11) {
+      if (r() < lit * 0.35) {
+        g.fillStyle = [C.amber, C.pink, C.teal][(r() * 3) | 0];
+        g.globalAlpha = 0.35 + r() * 0.4; g.fillRect(wx, wy, 4, 5); g.globalAlpha = 1;
+      }
+    }
+    x += w + r() * 10;
+  }
+  return { c, W, H, factor, color };
+}
+
+// ---------- world ----------
+const G = 2300, JUMP_V = 760, DJUMP_V = 660, HOLD_T = 0.22, HOLD_G = 0.42, RUN_H = 44, SLIDE_H = 22;
+let state = 'attract', paused = false, overSent = false;
+let roofs = [], obs = [], coins = [], parts = [], pops = [];
+let camX = 0, camY = -330, speed = 360, runT = 0, score = 0, best = 0, coinCount = 0, startX = 0, nextMile = 500;
+let shake = 0, hitstop = 0, flash = 0, time = 0, deadT = 0, overT = 0;
+const P = { x: 0, y: 0, vy: 0, ground: true, jumps: 0, coyote: 0, buffer: 0, holdT: 0, slideT: 0, sliding: false, diving: false,
+  queueSlide: false, dead: false, spin: 0, phase: 0, roofY: 0 };
+let jumpHeld = false, downHeld = false;
+
+function reset(demo) {
+  roofs = [{ x: -600, w: 1700, y: 0 }]; obs = []; coins = []; parts = []; pops = [];
+  Object.assign(P, { x: 0, y: 0, vy: 0, ground: true, jumps: 0, coyote: 0, buffer: 0, holdT: 0, slideT: 0, sliding: false,
+    diving: false, queueSlide: false, dead: false, spin: 0, roofY: 0 });
+  speed = 360; runT = 0; score = 0; coinCount = 0; startX = 0; nextMile = 500; deadT = 0; overT = 0;
+  hitstop = flash = shake = 0; coinStreak = 0;
+  camX = P.x - viewW * 0.24; camY = -viewH * ANCH;
+  for (let i = 0; i < 5; i++) coins.push({ x: 500 + i * 36, y: -30, t: false });
+  generate();
+}
+function newRun() {
+  audio(); reset(false); jumpHeld = downHeld = false; aiHold = 0; touch = null;
+  state = 'play'; paused = false; sfxOn = true; overSent = false;
+}
+function startAttract() { state = 'attract'; sfxOn = false; reset(true); }
+
+// rooftops are generated ahead of the camera; the layout stays fair for the current speed
+function generate() {
+  const sp = Math.max(speed, 380);
+  while (roofs[roofs.length - 1].x + roofs[roofs.length - 1].w < camX + viewW + 900) {
+    const prev = roofs[roofs.length - 1];
+    const hard = clamp(runT / 90, 0, 1);
+    const gapMax = Math.min(sp * 0.62, 400);
+    const gap = rand(90, lerp(160, gapMax, 0.4 + hard * 0.6));
+    let y = clamp(prev.y + rand(-80, 95), -170, 170);
+    if (gap > sp * 0.42) y = Math.max(y, prev.y - 55);           // big gap: no big climb
+    const w = rand(lerp(700, 420, hard), lerp(1200, 900, hard));
+    const x = prev.x + prev.w + gap;
+    roofs.push({ x, w, y });
+    // a coin arc across most gaps
+    if (Math.random() < 0.6) {
+      const top = Math.min(prev.y, y) - 110;
+      for (let i = 0; i < 5; i++) {
+        const f = (i + 1) / 6;
+        coins.push({ x: lerp(prev.x + prev.w - 30, x + 30, f), y: lerp(prev.y, y, f) - 40 - Math.sin(f * Math.PI) * (top < -200 ? 60 : 90), t: false });
+      }
+    }
+    // obstacles and coin runs on the rooftop
+    let cx = x + Math.max(220, sp * 0.6);
+    while (cx < x + w - 160) {
+      const roll = Math.random();
+      if (roll < 0.45 + hard * 0.3) {
+        const beam = runT > 8 && Math.random() < 0.42;
+        if (beam) {
+          const bw = rand(60, 110);
+          obs.push({ type: 'beam', x: cx, w: bw, y: y - 34 - 150, h: 150, roofY: y });
+          for (let i = 0; i < 3; i++) coins.push({ x: cx + 10 + i * (bw - 20) / 2, y: y - 14, t: false });
+          cx += bw;
+        } else {
+          const h = rand(26, 40 + hard * 12), vwid = rand(34, 60);
+          obs.push({ type: 'vent', x: cx, w: vwid, y: y - h, h, roofY: y });
+          if (Math.random() < 0.5) for (let i = 0; i < 3; i++) coins.push({ x: cx + vwid / 2 + (i - 1) * 34, y: y - h - 60 - (i === 1 ? 14 : 0), t: false });
+          cx += vwid;
+        }
+        cx += Math.max(260, sp * rand(0.85, 1.3));
+      } else {
+        const n = 4 + ((Math.random() * 4) | 0);
+        for (let i = 0; i < n && cx + i * 36 < x + w - 60; i++) coins.push({ x: cx + i * 36, y: y - 30, t: false });
+        cx += n * 36 + Math.max(180, sp * 0.5);
+      }
+    }
+  }
+  // forget what is behind the camera
+  const cut = camX - 300;
+  while (roofs.length > 2 && roofs[0].x + roofs[0].w < cut) roofs.shift();
+  obs = obs.filter((o) => o.x + o.w > cut);
+  if (coins.length > 120) coins = coins.filter((c) => c.x > cut && !c.t);
+}
+
+function roofAt(x) {
+  for (const r of roofs) if (x >= r.x && x <= r.x + r.w) return r;
+  return null;
+}
+function nextRoof(x) {
+  for (const r of roofs) if (r.x > x) return r;
+  return null;
+}
+
+// ---------- actions ----------
+function jump() {
+  if (P.dead || state === 'over') return;
+  if (P.ground || P.coyote > 0) {
+    P.vy = -JUMP_V; P.holdT = HOLD_T; P.ground = false; P.coyote = 0; P.jumps = 1; P.sliding = false; P.queueSlide = false;
+    sfx.jump(); dust(P.x, P.y, 6);
+  } else if (P.jumps < 2) {
+    P.vy = -DJUMP_V; P.holdT = HOLD_T * 0.6; P.jumps = 2; P.diving = false;
+    sfx.djump(); ring(P.x, P.y - 10);
+  } else P.buffer = 0.12;   // pressed just before landing: jump on touchdown
+}
+function slide() {
+  if (P.dead || state === 'over') return;
+  if (P.ground) { if (!P.sliding) sfx.slide(); P.sliding = true; P.slideT = 0.55; }
+  else { P.diving = true; P.vy = Math.max(P.vy, 750); P.queueSlide = true; P.holdT = 0; }
+}
+
+// ---------- effects ----------
+function addShake(a) { if (!reduced) shake = Math.min(16, shake + a); }
+function dust(x, y, n) {
+  for (let i = 0; i < n; i++) parts.push({ x: x + rand(-10, 10), y: y - 2, vx: rand(-160, 40), vy: rand(-120, -20), life: 0.45, max: 0.45, s: rand(2, 4), c: 'rgba(210,190,255,.8)', g: 300 });
+}
+function ring(x, y) {
+  for (let i = 0; i < 14; i++) { const a = i / 14 * Math.PI * 2; parts.push({ x, y, vx: Math.cos(a) * 220, vy: Math.sin(a) * 220, life: 0.35, max: 0.35, s: 3, c: C.teal, g: 0 }); }
+}
+function sparkle(x, y) {
+  for (let i = 0; i < 8; i++) parts.push({ x, y, vx: rand(-160, 160), vy: rand(-200, 80), life: 0.4, max: 0.4, s: rand(2, 4), c: i % 2 ? C.teal : C.white, g: 400 });
+}
+function pop(x, y, text, color, size = 22) { pops.push({ x, y, text, color, size, life: 0.9 }); }
+
+function die() {
+  if (P.dead) return;
+  P.dead = true; P.vy = -560; deadT = 0; hitstop = 0.12; addShake(12);
+  if (!reduced) flash = 0.5;
+  sfx.crash();
+  for (let i = 0; i < 26; i++) parts.push({ x: P.x, y: P.y - 22, vx: rand(-320, 260), vy: rand(-420, 80), life: rand(0.5, 1), max: 1, s: rand(3, 6), c: [C.pink, C.white, C.violet][i % 3], g: 900 });
+}
+function endRun() {
+  state = 'over'; overT = 0; best = Math.max(best, score);
+  sfx.over();
+  if (!overSent) { overSent = true; IC.gameOver(Math.floor(score)); }
+}
+
+// ---------- simulation ----------
+const STEP = 1 / 120;
+function update(dt) {
+  time += dt;
+  coinStreakT -= dt; if (coinStreakT <= 0) coinStreak = 0;
+
+  if (state === 'over') overT += dt;
+  if (state === 'attract') ai(dt);
+
+  if (!P.dead) {
+    if (state !== 'over') { runT += dt; speed = Math.min(820, 360 + runT * 5.5); }
+    const prevY = P.y, prevX = P.x;
+    P.x += speed * dt;
+    P.phase += speed * dt / 34;
+
+    // gravity, with a floatier rise while the jump is held
+    let g = G;
+    if (P.vy < 0 && jumpHeld && P.holdT > 0) { g = G * HOLD_G; P.holdT -= dt; }
+    else if (P.vy < 0 && !jumpHeld) { P.holdT = 0; g = G * 1.25; }
+    if (!P.ground) { P.vy = Math.min(P.vy + g * dt, 1400); P.y += P.vy * dt; }
+    P.coyote = Math.max(0, P.coyote - dt); P.buffer = Math.max(0, P.buffer - dt);
+
+    // side of a taller building
+    const front = roofAt(P.x + 10);
+    if (front && front.x > prevX + 10 - 1e-6 && P.y > front.y + 14) { die(); }
+    else {
+      const under = roofAt(P.x + 9) || roofAt(P.x - 9);
+      if (P.ground) {
+        if (!under) { P.ground = false; P.coyote = 0.09; P.vy = 0; }
+        else if (under.y < P.y) P.y = under.y;           // small step up
+        else if (under.y > P.y + 1) { P.ground = false; P.coyote = 0.09; P.vy = 0; } // stepping down
+      } else if (under && P.vy >= 0 && prevY <= under.y + 14 && P.y >= under.y) {
+        dust(P.x, P.y, P.diving ? 10 : 5); sfx.land();
+        P.y = under.y; P.vy = 0; P.ground = true; P.jumps = 0; P.diving = false;
+        if (P.queueSlide || downHeld) { P.queueSlide = false; P.sliding = true; P.slideT = 0.55; sfx.slide(); }
+        if (P.buffer > 0) { P.buffer = 0; jump(); }
+      }
+      if (P.ground) P.roofY = P.y;
+    }
+
+    // slide timing (stay low while something is overhead)
+    if (P.sliding) {
+      P.slideT -= dt;
+      const over = obs.some((o) => o.type === 'beam' && P.x + 20 > o.x && P.x - 20 < o.x + o.w);
+      if (P.slideT <= 0 && !downHeld && !over) P.sliding = false;
+      if (!P.ground) P.sliding = false;
+    }
+
+    // collisions with rooftop clutter
+    const h = P.sliding ? SLIDE_H : RUN_H, hw = P.sliding ? 18 : 11;
+    for (const o of obs) {
+      if (o.x > P.x + 40) break;
+      if (P.x + hw > o.x + 4 && P.x - hw < o.x + o.w - 4 && P.y - 2 > o.y + 3 && P.y - h < o.y + o.h - 2) { die(); break; }
+    }
+    // coins
+    for (const c of coins) {
+      if (c.t || c.x > P.x + 40) continue;
+      if (Math.abs(c.x - P.x) < 24 && Math.abs(c.y - (P.y - h / 2)) < h / 2 + 16) {
+        c.t = true; coinCount++; coinStreak++; coinStreakT = 0.6;
+        sparkle(c.x, c.y); sfx.coin();
+        if (state === 'play' || COVER) pop(c.x, c.y - 16, '+10', C.teal, 16);
+      }
+    }
+    if (P.y > P.roofY + 700) die();                     // fell into an alley
+  } else {
+    // tumble
+    P.vy += G * dt; P.y += P.vy * dt; P.x += speed * 0.25 * dt; P.spin += dt * 10;
+    deadT += dt;
+    if (deadT > 1.0 && state === 'play') endRun();
+    if (deadT > 1.4 && state === 'attract') reset(true);
+  }
+
+  if (state === 'play' || COVER) {
+    score = Math.floor((P.x - startX) / 25) + coinCount * 10;
+    const m = Math.floor((P.x - startX) / 25);
+    if (m >= nextMile && state === 'play') { pop(P.x + 140, P.y - 120, nextMile + ' m', C.amber, 30); sfx.mile(); nextMile += 500; }
+  }
+
+  // camera: runner sits left of centre, eased vertically toward the rooftop line
+  camX = P.x - viewW * 0.24;
+  const ty = (P.dead ? P.roofY : Math.min(P.roofY, P.y + 60)) - viewH * ANCH;
+  camY = lerp(camY, ty, 1 - Math.pow(0.02, dt));
+  generate();
+
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i]; p.life -= dt;
+    if (p.life <= 0) { parts.splice(i, 1); continue; }
+    p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  if (parts.length > 400) parts.splice(0, parts.length - 400);
+  for (let i = pops.length - 1; i >= 0; i--) { pops[i].life -= dt; pops[i].y -= 50 * dt; if (pops[i].life <= 0) pops.splice(i, 1); }
+  shake = Math.max(0, shake - dt * 32); flash = Math.max(0, flash - dt * 2.5);
+}
+
+// attract-mode pilot: reads the rooftop ahead and jumps, holds or slides
+let aiHold = 0;
+function ai(dt) {
+  if (P.dead) return;
+  aiHold -= dt; jumpHeld = aiHold > 0;
+  const here = roofAt(P.x + 9);
+  if (P.ground && here) {
+    const edge = here.x + here.w - P.x, nr = nextRoof(P.x);
+    if (edge < speed * 0.13 + 8 && nr) {
+      const gap = nr.x - (here.x + here.w);
+      jump(); aiHold = gap > speed * 0.3 || nr.y < here.y - 30 ? 0.25 : 0.06;
+      return;
+    }
+    for (const o of obs) {
+      const d = o.x - P.x;
+      if (d < -o.w || d > speed * 0.3) continue;
+      if (o.type === 'vent' && d < speed * 0.12 + 14 && d > 0) { jump(); aiHold = o.h > 36 ? 0.14 : 0.05; return; }
+      if (o.type === 'beam' && d < speed * 0.14 + 10) { if (!P.sliding) slide(); P.slideT = Math.max(P.slideT, 0.3); return; }
+    }
+  } else if (!P.ground && P.vy > 0 && P.jumps < 2) {
+    const nr = roofAt(P.x + 30) || nextRoof(P.x);
+    if (nr && P.y > nr.y - 18 && (P.x + 10 < nr.x || !roofAt(P.x))) { jump(); aiHold = 0.2; }
+  }
+}
+
+// ---------- rendering ----------
+function render() {
+  const g = ctx, px = k * dpr;
+  const sx = shake ? rand(-shake, shake) : 0, sy = shake ? rand(-shake, shake) : 0;
+
+  // sky in view units
+  g.setTransform(px, 0, 0, px, 0, 0);
+  const dyc = camY + viewH * ANCH;                      // camera height relative to the base rooftop line
+  const horizon = viewH * ANCH + 60 - dyc * 0.25;
+  const sky = g.createLinearGradient(0, 0, 0, horizon + 40);
+  sky.addColorStop(0, '#07021a'); sky.addColorStop(0.45, '#1d0840'); sky.addColorStop(0.78, '#5a1466'); sky.addColorStop(1, '#ff5e9a');
+  g.fillStyle = sky; g.fillRect(0, 0, viewW, viewH);
+
+  // stars
+  for (const s of stars) {
+    const y = s.y * horizon * 0.8;
+    const x = ((s.x * viewW * 1.2 - camX * 0.02) % (viewW * 1.2) + viewW * 1.2) % (viewW * 1.2);
+    g.globalAlpha = 0.35 + 0.35 * Math.sin(time * 2 + s.p);
+    g.fillStyle = '#fff'; g.fillRect(x, y, s.s, s.s);
+  }
+  g.globalAlpha = 1;
+
+  // striped sunset sun
+  const sunX = viewW * 0.7, sunY = horizon - 70, sr = Math.min(150, viewW * 0.16);
+  const sg = g.createLinearGradient(0, sunY - sr, 0, sunY + sr);
+  sg.addColorStop(0, '#ffd27a'); sg.addColorStop(0.55, '#ff6fa8'); sg.addColorStop(1, '#9b3cff');
+  g.save();
+  g.shadowColor = '#ff5e9a'; g.shadowBlur = 50 * k;
+  g.fillStyle = sg; g.beginPath(); g.arc(sunX, sunY, sr, 0, Math.PI * 2); g.fill();
+  g.restore();
+  g.fillStyle = '#4a1260';
+  for (let i = 0; i < 6; i++) { const yy = sunY + sr * (0.1 + i * 0.16); g.fillRect(sunX - sr, yy, sr * 2, 2 + i * 1.6); }
+
+  // parallax skyline strips
+  for (const s of strips) {
+    const base = horizon + (s === strips[0] ? 30 : 110) - dyc * s.factor * 0.6;
+    const off = -((camX * s.factor) % s.W);
+    for (let x = off; x < viewW; x += s.W) g.drawImage(s.c, x, base - s.H, s.W, s.H);
+    g.fillStyle = s.color; g.fillRect(0, base - 1, viewW, viewH - base + 2);
+  }
+  // haze over the horizon
+  const hz = g.createLinearGradient(0, horizon - 40, 0, horizon + 260);
+  hz.addColorStop(0, 'rgba(255,94,154,0)'); hz.addColorStop(1, 'rgba(255,94,154,.10)');
+  g.fillStyle = hz; g.fillRect(0, horizon - 40, viewW, 300);
+
+  // world
+  g.setTransform(px, 0, 0, px, (-camX + sx) * px, (-camY + sy) * px);
+  const bottom = camY + viewH + 20;
+  for (const r of roofs) {
+    if (r.x > camX + viewW || r.x + r.w < camX) continue;
+    g.fillStyle = C.roof; g.fillRect(r.x, r.y, r.w, bottom - r.y);
+    if (winPattern) {
+      g.save(); const o = (r.x * 0.37) % 192;
+      g.translate(r.x + o, r.y + 30);
+      g.fillStyle = winPattern; g.fillRect(-o + 14, 0, r.w - 28, bottom - r.y - 30);
+      g.restore();
+    }
+    // windows fade into the street haze below
+    const fade = g.createLinearGradient(0, r.y + 30, 0, r.y + 420);
+    fade.addColorStop(0, 'rgba(20,10,40,0)'); fade.addColorStop(1, 'rgba(10,4,24,.88)');
+    g.fillStyle = fade; g.fillRect(r.x, r.y + 30, r.w, bottom - r.y - 30);
+    // side rim light so the drop reads clearly
+    const rim = g.createLinearGradient(r.x, 0, r.x + 18, 0);
+    rim.addColorStop(0, 'rgba(155,92,255,.55)'); rim.addColorStop(1, 'rgba(155,92,255,0)');
+    g.fillStyle = rim; g.fillRect(r.x, r.y, 18, bottom - r.y);
+    g.fillStyle = C.ledge; g.fillRect(r.x - 4, r.y, r.w + 8, 9);
+    g.save(); g.shadowColor = C.teal; g.shadowBlur = 14 * k;
+    g.fillStyle = C.teal; g.fillRect(r.x - 4, r.y - 1, r.w + 8, 3);
+    g.restore();
+  }
+
+  // rooftop clutter
+  for (const o of obs) {
+    if (o.x > camX + viewW || o.x + o.w < camX) continue;
+    if (o.type === 'vent') {
+      g.fillStyle = '#2a1640'; rrect(g, o.x, o.y, o.w, o.h + 2, 5); g.fill();
+      g.save(); g.shadowColor = C.pink; g.shadowBlur = 12 * k;
+      g.strokeStyle = C.pink; g.lineWidth = 2.5; rrect(g, o.x, o.y, o.w, o.h + 2, 5); g.stroke(); g.restore();
+      g.strokeStyle = 'rgba(255,79,163,.45)'; g.lineWidth = 2; g.beginPath();
+      for (let yy = o.y + 8; yy < o.y + o.h - 2; yy += 7) { g.moveTo(o.x + 7, yy); g.lineTo(o.x + o.w - 7, yy); }
+      g.stroke();
+      // spinning fan blink on top
+      g.fillStyle = Math.sin(time * 6 + o.x) > 0 ? C.amber : '#7a4a20';
+      g.fillRect(o.x + o.w / 2 - 3, o.y - 5, 6, 4);
+    } else {
+      // hanging neon sign: slide under it
+      const by = o.y + o.h;
+      g.strokeStyle = 'rgba(200,180,255,.5)'; g.lineWidth = 2;
+      g.beginPath(); g.moveTo(o.x + 8, by - 26); g.lineTo(o.x + 8, camY - 10); g.moveTo(o.x + o.w - 8, by - 26); g.lineTo(o.x + o.w - 8, camY - 10); g.stroke();
+      g.save(); g.shadowColor = C.violet; g.shadowBlur = 18 * k;
+      g.fillStyle = '#2a0f4d'; rrect(g, o.x, by - 30, o.w, 30, 6); g.fill();
+      g.strokeStyle = C.violet; g.lineWidth = 3; rrect(g, o.x, by - 30, o.w, 30, 6); g.stroke();
+      g.restore();
+      const on = Math.sin(time * 9 + o.x) > -0.7;
+      g.fillStyle = on ? C.pink : 'rgba(255,79,163,.3)';
+      for (let i = 0, n = Math.floor((o.w - 20) / 14); i < n; i++) g.fillRect(o.x + 10 + i * 14, by - 21, 9, 12);
+      // warning stripe on the underside
+      g.fillStyle = C.amber; g.fillRect(o.x + 4, by - 3, o.w - 8, 3);
+    }
+  }
+
+  // coins
+  for (const c of coins) {
+    if (c.t || c.x < camX - 20 || c.x > camX + viewW + 20) continue;
+    const w = Math.abs(Math.cos(time * 4 + c.x * 0.02));
+    g.save(); g.translate(c.x, c.y); g.scale(Math.max(0.15, w), 1);
+    g.shadowColor = C.teal; g.shadowBlur = 12 * k;
+    g.fillStyle = C.teal; g.beginPath(); g.arc(0, 0, 9, 0, Math.PI * 2); g.fill();
+    g.shadowBlur = 0; g.fillStyle = '#0d6b63'; g.beginPath(); g.arc(0, 0, 5, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#c9fff4'; g.fillRect(-1.5, -4, 3, 8);
+    g.restore();
+  }
+
+  drawRunner(g);
+
+  // particles
+  g.globalCompositeOperation = 'lighter';
+  for (const p of parts) { g.globalAlpha = clamp(p.life / p.max, 0, 1); g.fillStyle = p.c; g.fillRect(p.x - p.s / 2, p.y - p.s / 2, p.s, p.s); }
+  g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+
+  for (const p of pops) {
+    g.globalAlpha = clamp(p.life / 0.4, 0, 1);
+    g.font = `900 ${p.size}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillStyle = p.color; g.fillText(p.text, p.x, p.y);
+  }
+  g.globalAlpha = 1;
+
+  // speed lines at high speed
+  if (speed > 520 && !reduced && (state === 'play' || COVER)) {
+    g.setTransform(px, 0, 0, px, 0, 0);
+    g.strokeStyle = `rgba(255,255,255,${(speed - 520) / 1500})`; g.lineWidth = 1.5; g.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const y = (i * 131.7) % viewH;
+      const x = viewW - ((time * speed * 2.2 + i * 211) % (viewW + 300));
+      g.moveTo(x, y); g.lineTo(x + 120, y);
+    }
+    g.stroke();
+  }
+
+  if (flash > 0) { g.setTransform(dpr, 0, 0, dpr, 0, 0); g.fillStyle = `rgba(255,120,200,${flash * 0.35})`; g.fillRect(0, 0, vw, vh); }
+  hud();
+  overlays();
+}
+
+function drawRunner(g) {
+  const x = P.x, y = P.y;
+  g.save();
+  g.translate(x, y);
+  if (P.dead) { g.translate(0, -22); g.rotate(P.spin); g.translate(0, 22); }
+  // motion trail
+  if (!P.dead) {
+    const tr = g.createLinearGradient(-90, 0, 0, 0);
+    tr.addColorStop(0, 'rgba(255,79,163,0)'); tr.addColorStop(1, 'rgba(255,79,163,.45)');
+    g.fillStyle = tr;
+    if (P.sliding) g.fillRect(-90, -16, 80, 8); else g.fillRect(-80, -34, 72, 7);
+  }
+  g.shadowColor = C.pink; g.shadowBlur = 16 * k;
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  const s = Math.sin(P.phase), c2 = Math.cos(P.phase);
+  if (P.sliding && !P.dead) {
+    // low sliding pose, leaning back
+    g.strokeStyle = C.white; g.lineWidth = 6;
+    g.beginPath(); g.moveTo(-12, -10); g.lineTo(14, -3); g.lineTo(26, -2); g.stroke();      // legs
+    g.beginPath(); g.moveTo(-12, -10); g.lineTo(-22, -18); g.stroke();                       // torso
+    g.lineWidth = 4; g.beginPath(); g.moveTo(-18, -16); g.lineTo(-30, -6); g.stroke();       // arm
+    g.fillStyle = C.white; g.beginPath(); g.arc(-26, -24, 7, 0, Math.PI * 2); g.fill();
+    g.fillStyle = C.teal; g.fillRect(-24, -27, 7, 4);
+    scarf(g, -26, -18, 1);
+  } else {
+    const air = !P.ground && !P.dead;
+    const l1 = air ? -0.9 : s * 0.9, l2 = air ? 0.5 : -s * 0.9;
+    g.strokeStyle = C.white; g.lineWidth = 6;
+    // legs: thigh + shin
+    for (const [a, kn] of [[l1, Math.max(0, -c2) * 1.2 + (air ? 1.2 : 0.2)], [l2, Math.max(0, c2) * 1.2 + (air ? 0.4 : 0.2)]]) {
+      const kx = Math.sin(a) * 12, ky = -22 + Math.cos(a) * 12;
+      g.beginPath(); g.moveTo(0, -22); g.lineTo(kx, ky); g.lineTo(kx + Math.sin(a - kn) * 12, ky + Math.cos(a - kn) * 12); g.stroke();
+    }
+    // torso, leaning into the run
+    g.beginPath(); g.moveTo(0, -22); g.lineTo(5, -40); g.stroke();
+    g.lineWidth = 4;
+    const a1 = air ? -2.4 : -s * 1.1, a2 = air ? -2.0 : s * 1.1;
+    for (const a of [a1, a2]) { g.beginPath(); g.moveTo(4, -37); g.lineTo(4 + Math.sin(a) * 13, -37 + Math.cos(a) * 13); g.stroke(); }
+    g.fillStyle = C.white; g.beginPath(); g.arc(8, -48, 7.5, 0, Math.PI * 2); g.fill();
+    g.fillStyle = C.teal; g.fillRect(9, -51, 8, 4);                                          // visor
+    scarf(g, 3, -41, 0);
+  }
+  g.restore();
+}
+function scarf(g, x, y, low) {
+  g.shadowBlur = 0;
+  g.strokeStyle = C.pink; g.lineWidth = 4;
+  g.beginPath(); g.moveTo(x, y);
+  for (let i = 1; i <= 4; i++) g.lineTo(x - i * 8, y + Math.sin(time * 18 - i) * (2 + i) + (low ? 0 : i * 1.5));
+  g.stroke();
+}
+
+function txt(t, x, y, size, color, align = 'center', weight = 800) {
+  ctx.font = `${weight} ${size * hs}px ${FONT}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillStyle = color; ctx.fillText(t, x, y);
+}
+function hud() {
+  if (state === 'attract' && !COVER) return;
+  const g = ctx;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const pad = 16 * hs;
+  g.save(); g.shadowColor = 'rgba(0,0,0,.6)'; g.shadowBlur = 8;
+  txt(String(Math.floor(score)), pad, pad + 16 * hs, 32, C.white, 'left', 900);
+  txt('BEST ' + Math.max(best, Math.floor(score)), pad, pad + 44 * hs, 13, C.dim, 'left', 700);
+  const m = Math.max(0, Math.floor((P.x - startX) / 25));
+  txt(m + ' m', vw - pad, pad + 14 * hs, 20, C.amber, 'right', 800);
+  // coin counter
+  const cy = pad + 42 * hs;
+  txt(String(coinCount), vw - pad, cy, 18, C.teal, 'right', 800);
+  ctx.font = `800 ${18 * hs}px ${FONT}`;
+  const tw = ctx.measureText(String(coinCount)).width;
+  g.fillStyle = C.teal; g.beginPath(); g.arc(vw - pad - tw - 14 * hs, cy, 7 * hs, 0, Math.PI * 2); g.fill();
+  g.restore();
+}
+function overlays() {
+  const g = ctx;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const cx = vw / 2, cy = vh / 2;
+  const veil = (a) => { g.fillStyle = `rgba(8,3,22,${a})`; g.fillRect(0, 0, vw, vh); };
+  const blink = 0.55 + Math.sin(time * 4) * 0.45;
+  if (COVER) return;
+  if (state === 'attract') {
+    veil(0.35);
+    const pw = Math.min(vw - 24, 560 * hs), ph = 250 * hs;
+    g.fillStyle = 'rgba(10,4,26,.78)'; g.strokeStyle = 'rgba(255,79,163,.35)'; g.lineWidth = 1.5;
+    rrect(g, cx - pw / 2, cy - ph / 2, pw, ph, 22 * hs); g.fill(); g.stroke();
+    g.save();
+    g.font = `900 ${Math.min(64 * hs, pw / 7.2)}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    const tg = g.createLinearGradient(cx - pw / 2, 0, cx + pw / 2, 0);
+    tg.addColorStop(0, C.teal); tg.addColorStop(0.5, C.violet); tg.addColorStop(1, C.pink);
+    g.shadowColor = C.pink; g.shadowBlur = reduced ? 8 : 22 + Math.sin(time * 3) * 8;
+    g.fillStyle = tg; g.fillText('ROOFTOP DASH', cx, cy - 70 * hs);
+    g.restore();
+    g.globalAlpha = blink;
+    txt(IC.standalone ? (coarse ? 'TAP TO PLAY' : 'PRESS SPACE OR CLICK TO PLAY') : 'PRESS START', cx, cy - 8 * hs, 20, C.white);
+    g.globalAlpha = 1;
+    if (coarse) {
+      txt('Tap to jump · hold to go higher · tap again to double jump', cx, cy + 36 * hs, 12.5, C.dim, 'center', 600);
+      txt('Swipe down to slide under signs', cx, cy + 58 * hs, 12.5, C.dim, 'center', 600);
+    } else {
+      txt('Space / ↑ / W to jump · hold for height · again in the air to double jump', cx, cy + 36 * hs, 13, C.dim, 'center', 600);
+      txt('↓ / S to slide (or dive in the air) · M to mute', cx, cy + 58 * hs, 13, C.dim, 'center', 600);
+    }
+    if (best) txt('BEST ' + best, cx, cy + 92 * hs, 15, C.teal);
+  } else if (state === 'over') {
+    veil(0.4);
+    const pw = Math.min(vw - 24, 440 * hs), ph = 250 * hs;
+    g.fillStyle = 'rgba(10,4,26,.8)'; g.strokeStyle = 'rgba(255,79,163,.35)'; g.lineWidth = 1.5;
+    rrect(g, cx - pw / 2, cy - 112 * hs, pw, ph, 22 * hs); g.fill(); g.stroke();
+    txt('WIPEOUT', cx, cy - 72 * hs, 50, C.pink, 'center', 900);
+    txt(String(Math.floor(score)), cx, cy - 12 * hs, 46, C.white, 'center', 900);
+    const m = Math.max(0, Math.floor((P.x - startX) / 25));
+    txt(m + ' m  ·  ' + coinCount + ' coins', cx, cy + 28 * hs, 15, C.dim, 'center', 700);
+    txt(score >= best && score > 0 ? 'NEW BEST!' : 'BEST ' + best, cx, cy + 54 * hs, 16, C.teal, 'center', 800);
+    if (overT > 0.8) {
+      g.globalAlpha = blink;
+      txt(IC.standalone ? (coarse ? 'TAP TO RUN AGAIN' : 'PRESS SPACE TO RUN AGAIN') : 'PRESS START TO RUN AGAIN', cx, cy + 96 * hs, 17, C.white);
+      g.globalAlpha = 1;
+    }
+  }
+  if (paused) {
+    veil(0.65);
+    txt('PAUSED', cx, cy - 16 * hs, 44, C.teal, 'center', 900);
+    txt(coarse ? 'Tap to continue' : 'Click or press a key to continue', cx, cy + 26 * hs, 16, C.dim, 'center', 600);
+  }
+}
+
+// ---------- main loop ----------
+let last = performance.now(), acc = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  if (!paused) {
+    if (hitstop > 0) hitstop -= dt;
+    else { acc += dt; while (acc >= STEP) { update(STEP); acc -= STEP; } }
+    if (touch && !touch.decided && performance.now() - touch.t > 70) decideJump();
+  }
+  render();
+}
+
+// ---------- input ----------
+function metaGesture() {
+  audio();
+  if (paused) { paused = false; last = performance.now(); return true; }
+  if (IC.standalone && state === 'attract') { newRun(); return true; }
+  if (IC.standalone && state === 'over' && overT > 0.8) { newRun(); return true; }
+  return false;
+}
+const JUMP_KEYS = [' ', 'ArrowUp', 'w', 'W', 'Enter'], DOWN_KEYS = ['ArrowDown', 's', 'S'];
+addEventListener('keydown', (e) => {
+  const k = e.key;
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' ', 'Enter'].includes(k)) e.preventDefault();
+  if (k === 'm' || k === 'M') { audio(); setMuted(!muted); return; }
+  if (e.repeat) return;
+  if (paused) { metaGesture(); return; }
+  if (JUMP_KEYS.includes(k) && metaGesture()) return;
+  if (state !== 'play') return;
+  if ((k === 'p' || k === 'P' || k === 'Escape')) { paused = true; return; }
+  if (JUMP_KEYS.includes(k)) { jumpHeld = true; jump(); }
+  if (DOWN_KEYS.includes(k)) { downHeld = true; slide(); }
+});
+addEventListener('keyup', (e) => {
+  if (JUMP_KEYS.includes(e.key)) jumpHeld = false;
+  if (DOWN_KEYS.includes(e.key)) downHeld = false;
+});
+
+// pointer: tap = jump (hold for height), swipe down = slide / dive.
+// The jump waits up to 70 ms so a swipe can be told apart from a tap.
+let touch = null;
+function decideJump() { if (touch && !touch.decided) { touch.decided = 'jump'; jumpHeld = true; jump(); } }
+cv.addEventListener('pointerdown', (e) => {
+  e.preventDefault(); cv.focus();
+  if (metaGesture()) { touch = null; return; }
+  if (state !== 'play') return;
+  touch = { id: e.pointerId, y: e.clientY, t: performance.now(), decided: false };
+  try { cv.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+});
+cv.addEventListener('pointermove', (e) => {
+  if (!touch || touch.id !== e.pointerId) return;
+  if (e.clientY - touch.y > 26) {
+    if (touch.decided !== 'slide') { touch.decided = 'slide'; jumpHeld = false; downHeld = true; slide(); }
+    touch.y = e.clientY;
+  } else if (e.clientY < touch.y) touch.y = e.clientY;
+});
+const release = (e) => {
+  if (!touch || touch.id !== e.pointerId) return;
+  if (!touch.decided) decideJump();
+  jumpHeld = false; downHeld = false; touch = null;
+};
+cv.addEventListener('pointerup', release);
+cv.addEventListener('pointercancel', release);
+cv.addEventListener('contextmenu', (e) => e.preventDefault());
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') paused = true;
+  jumpHeld = downHeld = false;
+});
+addEventListener('blur', () => { jumpHeld = downHeld = false; });
+addEventListener('resize', layout);
+
+// ---------- SDK wiring ----------
+IC.on('init', (d) => setMuted(d && d.muted));
+IC.on('mute', (d) => setMuted(d && d.muted));
+IC.on('start', () => { newRun(); cv.focus(); });
+
+layout();
+startAttract();
+requestAnimationFrame(frame);
+IC.ready();
+})();
+</script>
+</body>
+</html>

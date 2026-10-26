@@ -1,0 +1,105 @@
+// Insert Coin: only what can show on any page (a crown on a user card, the
+// recent crowns widget). The arcade's pages bring their own styles
+// (less/pages.less, compiled into a lazy chunk by js/tools/css.mjs), so
+// forum.css carries none of them for the forum's other pages.
+
+@ic-gold: #facc15;
+
+// ---------------------------------------------------------------- shared
+
+.InsertCoinAvatar {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+
+  .Avatar {
+    --size: 32px;
+    width: var(--size);
+    height: var(--size);
+    font-size: calc(var(--size) * 0.45);
+    line-height: var(--size);
+  }
+
+  &--crowned .Avatar {
+    box-shadow: 0 0 0 2px @ic-gold;
+  }
+}
+
+.InsertCoinAvatar-crown {
+  position: absolute;
+  top: -11px;
+  left: 50%;
+  transform: translateX(-50%) rotate(-8deg);
+  color: @ic-gold;
+  font-size: 13px;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.4));
+}
+
+.InsertCoinPerson {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-color);
+
+  &:hover .InsertCoinPerson-name {
+    text-decoration: underline;
+  }
+}
+
+.InsertCoinPerson-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.InsertCoinCrownChip {
+  color: inherit;
+  font-weight: 600;
+
+  .icon {
+    color: @ic-gold;
+  }
+}
+
+// ---------------------------------------------------------------- crowns list
+
+.InsertCoinCrowns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.InsertCoinCrowns-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 10px 0 6px;
+  font-size: 13px;
+
+  & + & {
+    border-top: 1px solid var(--control-bg);
+  }
+}
+
+.InsertCoinCrowns-text {
+  min-width: 0;
+  line-height: 1.4;
+}
+
+.InsertCoinCrowns-meta {
+  color: var(--muted-color);
+  font-size: 12px;
+}
+
+// ---------------------------------------------------------------- widget
+
+.InsertCoinWidget-heading {
+  margin: 0 0 8px;
+}
+
+.InsertCoinWidget-empty {
+  color: var(--muted-color);
+  font-size: 13px;
+}
