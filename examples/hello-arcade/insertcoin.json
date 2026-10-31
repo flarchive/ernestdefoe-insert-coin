@@ -1,0 +1,14 @@
+{
+  "title": "Hello Arcade",
+  "description": "The smallest Insert Coin game: click the target as many times as you can in ten seconds.",
+  "entry": "index.html",
+  "width": 4,
+  "height": 3,
+  "mobile": true,
+  "scoreOrder": "high",
+  "scoreLabel": "hits",
+  "ceiling": 200,
+  "minSeconds": 9,
+  "thumbnail": "cover.png",
+  "category": "Skill"
+}
