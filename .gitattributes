@@ -1,0 +1,4 @@
+/tests export-ignore
+/.github export-ignore
+/.styleci.yml export-ignore
+/phpstan.neon export-ignore

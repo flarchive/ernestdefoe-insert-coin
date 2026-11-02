@@ -1,0 +1,105 @@
+.InsertCoinAdmin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+
+  label.Button {
+    cursor: pointer;
+  }
+}
+
+.InsertCoinAdmin-queue {
+  font-weight: 600;
+}
+
+.InsertCoinAdmin-legal {
+  max-width: 70ch;
+}
+
+.InsertCoinAdmin-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  max-width: 760px;
+}
+
+.InsertCoinAdmin-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border-radius: var(--border-radius);
+  background: var(--body-bg);
+  box-shadow: 0 0 0 1px var(--control-bg);
+  cursor: grab;
+
+  &.is-dragging {
+    opacity: 0.5;
+  }
+
+  .Checkbox {
+    margin: 0;
+  }
+}
+
+.InsertCoinAdmin-grip {
+  color: var(--muted-color);
+}
+
+.InsertCoinAdmin-thumb {
+  width: 64px;
+  height: 40px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--border-radius);
+  background: var(--control-bg);
+  overflow: hidden;
+
+  img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+}
+
+.InsertCoinAdmin-name {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+
+  .helpText {
+    margin: 0;
+    font-size: 12px;
+  }
+}
+
+.InsertCoinGameModal-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+.InsertCoinAdmin-more {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-width: 760px;
+
+  li {
+    display: flex;
+    flex-direction: column;
+    padding: 6px 0;
+  }
+
+  a {
+    font-weight: 600;
+  }
+
+  .helpText {
+    margin: 0;
+  }
+}

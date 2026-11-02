@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Quickdraw</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14061a; }
+  body { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0" aria-label="Quickdraw"></canvas>
+<script>
+/* Quickdraw: an original neon reaction duel for the Insert Coin arcade. MIT. */
+(() => {
+  'use strict';
+
+  const IC = window.InsertCoin || { standalone: true, muted: false, ready() {}, gameOver() {}, submitScore() {}, on() {} };
+
+  const cv = document.getElementById('c');
+  const g = cv.getContext('2d');
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const coarse = matchMedia('(pointer: coarse)').matches;
+  const FONT = 'ui-rounded, system-ui, -apple-system, "Segoe UI", sans-serif';
+  const MONO = 'ui-monospace, "SF Mono", Menlo, Consolas, monospace';
+
+  const ROUNDS = 5;
+  const PENALTY = 500;        // ms added per false start
+  const MAX_FALSES = 3;       // the third false start loses the round
+  const SLOW = 1000;          // a reaction is capped here ("too slow")
+  const MISFIRE = 2000;       // a lost round; also the most any round can cost
+  const ANTICIPATE = 90;      // faster than this is a guess, not a reaction
+  const MUZZLE = 0.3;         // seconds a muzzle flash + tracer lingers
+  // the five outlaws: how fast each one clears leather (flavour only, the score is yours alone)
+  const OUTLAWS = [
+    { name: 'Dusty Vane', ms: 430, hue: 18 },
+    { name: 'Marigold Kade', ms: 370, hue: 335 },
+    { name: 'Hollow Pete', ms: 320, hue: 280 },
+    { name: 'Sable Rourke', ms: 280, hue: 350 },
+    { name: 'The Widow Ash', ms: 245, hue: 300 },
+  ];
+
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const ease = (t) => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+
+  // ---------------------------------------------------------------- audio
+  let actx = null, master = null, echo = null, noiseBuf = null, wind = null;
+  let muted = !!IC.muted;
+  function audio() {
+    try {
+      if (!actx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        actx = new AC();
+        master = actx.createGain(); master.gain.value = muted ? 0 : 0.6; master.connect(actx.destination);
+        noiseBuf = actx.createBuffer(1, actx.sampleRate * 2, actx.sampleRate);
+        const d = noiseBuf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        // canyon echo for gunshots
+        echo = actx.createGain();
+        const dl = actx.createDelay(1), fb = actx.createGain(), lp = actx.createBiquadFilter();
+        dl.delayTime.value = 0.21; fb.gain.value = 0.32; lp.type = 'lowpass'; lp.frequency.value = 1400;
+        echo.connect(master); echo.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(master);
+        // desert wind: looping noise through a wandering low-pass
+        const src = actx.createBufferSource(), f = actx.createBiquadFilter(), gn = actx.createGain();
+        const lfo = actx.createOscillator(), lfoG = actx.createGain();
+        src.buffer = noiseBuf; src.loop = true;
+        f.type = 'lowpass'; f.frequency.value = 420; f.Q.value = 3;
+        lfo.frequency.value = 0.13; lfoG.gain.value = 220; lfo.connect(lfoG).connect(f.frequency);
+        gn.gain.value = 0.05;
+        src.connect(f).connect(gn).connect(master);
+        src.start(); lfo.start();
+        wind = gn;
+      }
+      if (actx.state === 'suspended') actx.resume().catch(() => {});
+    } catch (e) { /* audio is optional */ }
+    return actx;
+  }
+  const live = () => actx && !muted && actx.state === 'running';
+  function setMuted(m) {
+    muted = !!m;
+    if (master) master.gain.setTargetAtTime(muted ? 0 : 0.6, actx.currentTime, 0.02);
+  }
+  function windLevel(v) { if (wind) wind.gain.setTargetAtTime(v, actx.currentTime, 0.4); }
+  function tone(freq, dur, o = {}) {
+    if (!live()) return;
+    const t = actx.currentTime + (o.delay || 0);
+    const osc = actx.createOscillator(), gn = actx.createGain();
+    osc.type = o.type || 'sine';
+    osc.frequency.setValueAtTime(freq, t);
+    if (o.slide) osc.frequency.exponentialRampToValueAtTime(Math.max(30, freq * o.slide), t + dur);
+    gn.gain.setValueAtTime(0.0001, t);
+    gn.gain.exponentialRampToValueAtTime(o.vol || 0.2, t + (o.attack || 0.005));
+    gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gn).connect(o.bus || master);
+    osc.start(t); osc.stop(t + dur + 0.03);
+  }
+  function noise(dur, o = {}) {
+    if (!live()) return;
+    const t = actx.currentTime + (o.delay || 0);
+    const src = actx.createBufferSource(), f = actx.createBiquadFilter(), gn = actx.createGain();
+    src.buffer = noiseBuf;
+    f.type = o.filter || 'lowpass'; f.Q.value = o.q || 0.8;
+    f.frequency.setValueAtTime(o.freq || 1200, t);
+    if (o.sweep) f.frequency.exponentialRampToValueAtTime(o.sweep, t + dur);
+    let out = gn;
+    if (o.pan && actx.createStereoPanner) { const p = actx.createStereoPanner(); p.pan.value = o.pan; gn.connect(p); out = p; }
+    gn.gain.setValueAtTime(o.vol || 0.3, t);
+    gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f).connect(gn);
+    out.connect(o.bus || master);
+    src.start(t, Math.random()); src.stop(t + dur + 0.03);
+  }
+  const sfx = {
+    tick(alt) { noise(0.035, { filter: 'bandpass', freq: alt ? 2300 : 3400, q: 6, vol: 0.5 }); },
+    heart() { tone(62, 0.16, { vol: 0.32 }); tone(55, 0.14, { vol: 0.22, delay: 0.17 }); },
+    draw() { tone(1568, 0.6, { vol: 0.22 }); tone(2349, 0.4, { vol: 0.09 }); tone(3136, 0.2, { vol: 0.05 }); noise(0.05, { filter: 'highpass', freq: 5000, vol: 0.2 }); },
+    shot(pan) {
+      noise(0.45, { freq: 7000, sweep: 260, vol: 0.85, bus: echo, pan });
+      tone(120, 0.28, { vol: 0.5, slide: 0.35, bus: echo });
+    },
+    ricochet() { tone(2400, 0.32, { type: 'triangle', vol: 0.05, slide: 0.45, delay: 0.12 }); },
+    fault() { tone(150, 0.28, { type: 'square', vol: 0.11 }); tone(104, 0.34, { type: 'square', vol: 0.11, delay: 0.13 }); noise(0.06, { filter: 'highpass', freq: 3000, vol: 0.15 }); },
+    win() { [659, 988].forEach((f, i) => tone(f, 0.22, { type: 'triangle', vol: 0.12, delay: 0.3 + i * 0.09 })); },
+    lose() { tone(330, 0.4, { type: 'triangle', vol: 0.1, slide: 0.7, delay: 0.35 }); },
+    begin() { [294, 392, 494].forEach((f, i) => tone(f, 0.16, { type: 'triangle', vol: 0.12, delay: i * 0.1 })); },
+    finale() { [392, 494, 587, 784].forEach((f, i) => tone(f, 0.3, { type: 'triangle', vol: 0.12, delay: i * 0.11 })); },
+  };
+  IC.on('init', (d) => setMuted(d && d.muted));
+  IC.on('mute', (d) => setMuted(d && d.muted));
+
+  // ---------------------------------------------------------------- layout + scenery
+  let W = 0, H = 0, dpr = 1, U = 1, groundY = 0;
+  let bg = null;
+  const stars = Array.from({ length: 90 }, () => ({ x: Math.random(), y: Math.random() * 0.6, r: rnd(0.4, 1.4), p: rnd(0, 6.28) }));
+  const ridge = Array.from({ length: 13 }, (_, i) => 0.35 + 0.65 * Math.abs(Math.sin(i * 1.7 + 0.6)));
+
+  function layout() {
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    U = Math.min(W / 16, H / 9) / 100; // 1 U = 1/100 of a 16:9 grid cell: sizes stay sane at any aspect
+    groundY = H * (W / H < 1 ? 0.6 : 0.66);
+    buildBg();
+  }
+
+  function buildBg() {
+    bg = document.createElement('canvas'); bg.width = cv.width; bg.height = cv.height;
+    const b = bg.getContext('2d'); b.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const sky = b.createLinearGradient(0, 0, 0, groundY);
+    sky.addColorStop(0, '#12051a'); sky.addColorStop(0.55, '#2a0b2e'); sky.addColorStop(1, '#5b1a3a');
+    b.fillStyle = sky; b.fillRect(0, 0, W, groundY);
+    // sun with synthwave slats
+    const R = Math.min(W * 0.2, H * 0.26), sx = W / 2, sy = groundY - R * 0.35;
+    const halo = b.createRadialGradient(sx, sy, R * 0.6, sx, sy, R * 2.4);
+    halo.addColorStop(0, 'rgba(251,146,60,0.32)'); halo.addColorStop(1, 'rgba(251,146,60,0)');
+    b.fillStyle = halo; b.fillRect(0, 0, W, groundY);
+    b.save();
+    b.beginPath(); b.arc(sx, sy, R, 0, 6.283); b.clip();
+    const sun = b.createLinearGradient(0, sy - R, 0, sy + R);
+    sun.addColorStop(0, '#fde68a'); sun.addColorStop(0.45, '#fb923c'); sun.addColorStop(1, '#db2777');
+    b.fillStyle = sun; b.fillRect(sx - R, sy - R, R * 2, R * 2);
+    b.globalCompositeOperation = 'destination-out';
+    for (let i = 0; i < 7; i++) {
+      const y = sy + R * (0.02 + i * 0.15), h = R * (0.025 + i * 0.016);
+      b.fillRect(sx - R, y, R * 2, h);
+    }
+    b.restore();
+    // mesas
+    b.fillStyle = '#240a26';
+    b.beginPath(); b.moveTo(0, groundY);
+    const n = ridge.length;
+    for (let i = 0; i < n; i++) {
+      const x0 = (i / n) * W, x1 = ((i + 1) / n) * W, hgt = ridge[i] * H * 0.13 * (Math.abs(i - n / 2) / (n / 2) + 0.35);
+      b.lineTo(x0 + (x1 - x0) * 0.15, groundY - hgt); b.lineTo(x0 + (x1 - x0) * 0.85, groundY - hgt);
+    }
+    b.lineTo(W, groundY); b.closePath(); b.fill();
+    b.strokeStyle = 'rgba(251,146,60,0.35)'; b.lineWidth = 1; b.stroke();
+    // ground with a neon perspective grid
+    const gr = b.createLinearGradient(0, groundY, 0, H);
+    gr.addColorStop(0, '#2b0a26'); gr.addColorStop(1, '#0c0310');
+    b.fillStyle = gr; b.fillRect(0, groundY, W, H - groundY);
+    b.save(); b.beginPath(); b.rect(0, groundY, W, H - groundY); b.clip();
+    b.strokeStyle = 'rgba(251,146,60,0.28)'; b.lineWidth = 1;
+    for (let i = -14; i <= 14; i++) { b.beginPath(); b.moveTo(W / 2 + i * W * 0.02, groundY); b.lineTo(W / 2 + i * W * 0.2, H); b.stroke(); }
+    for (let i = 1; i < 12; i++) { const y = groundY + (H - groundY) * Math.pow(i / 11, 2.2); b.globalAlpha = 0.25 + i / 20; b.beginPath(); b.moveTo(0, y); b.lineTo(W, y); b.stroke(); }
+    b.restore();
+    b.strokeStyle = '#fb923c'; b.lineWidth = 2; b.shadowColor = '#f97316'; b.shadowBlur = 12;
+    b.beginPath(); b.moveTo(0, groundY); b.lineTo(W, groundY); b.stroke();
+    // cacti
+    b.shadowBlur = 0;
+    cactus(b, W * 0.07, groundY, H * 0.11);
+    cactus(b, W * 0.93, groundY, H * 0.08);
+  }
+  function cactus(b, x, y, h) {
+    b.save(); b.strokeStyle = '#3a0f33'; b.lineCap = 'round'; b.lineWidth = h * 0.16;
+    b.beginPath(); b.moveTo(x, y); b.lineTo(x, y - h);
+    b.moveTo(x, y - h * 0.45); b.lineTo(x - h * 0.25, y - h * 0.45); b.lineTo(x - h * 0.25, y - h * 0.75);
+    b.moveTo(x, y - h * 0.6); b.lineTo(x + h * 0.22, y - h * 0.6); b.lineTo(x + h * 0.22, y - h * 0.85);
+    b.stroke(); b.restore();
+  }
+
+  // ---------------------------------------------------------------- state
+  let mode = 'attract';     // attract | play | over
+  let phase = 'idle';       // intro | steady | draw | false | result
+  let paused = false;
+  let round = 0, rounds = [], falses = 0, total = 0, best = null, newBest = false, reported = false;
+  let clock = 0, phaseAt = 0, drawClock = 0, nextTick = 0, tickN = 0;
+  let drawAt = 0, lastReact = 0, lastKind = '', overT = 0, time = 0;
+  let shake = 0, flash = 0, flashRGB = '255,240,200', hitStop = 0;
+  // the duel figures: arm 0..1 (holster -> aimed), fall 0..1, muzzle flash timer
+  const you = { arm: 0, armTo: 0, fall: 0, falling: false, muzzle: 0 };
+  const foe = { arm: 0, armTo: 0, fall: 0, falling: false, muzzle: 0 };
+  const parts = [];
+  const weeds = [];
+
+  const opp = () => OUTLAWS[Math.min(round, ROUNDS - 1)];
+  function setPhase(p) { phase = p; phaseAt = clock; }
+  function resetFigures() {
+    for (const f of [you, foe]) { f.arm = 0; f.armTo = 0; f.fall = 0; f.falling = false; f.muzzle = 0; }
+  }
+
+  function newRun() {
+    audio();
+    mode = 'play'; paused = false;
+    round = 0; rounds = []; total = 0; reported = false; newBest = false;
+    parts.length = 0; shake = 0; flash = 0; hitStop = 0;
+    startRound();
+    sfx.begin();
+  }
+  function startRound() {
+    falses = 0; resetFigures(); setPhase('intro');
+  }
+  function enterSteady() {
+    setPhase('steady');
+    drawClock = clock + rnd(1.2, 4.0);
+    nextTick = clock + 0.25; tickN = 0;
+    windLevel(0.09);
+  }
+  function enterDraw(now) {
+    setPhase('draw');
+    drawAt = now;           // the timestamp of the frame that first shows DRAW
+    flash = 1; flashRGB = '255,236,179';
+    sfx.draw();
+    windLevel(0.03);
+  }
+  function falseStart(kind) {
+    falses++;
+    lastKind = kind;
+    setPhase('false');
+    flash = 0.8; flashRGB = '244,63,94'; shake = 10;
+    sfx.fault();
+    windLevel(0.05);
+  }
+  function resolve(react, outcome) {
+    const ms = outcome === 'misfire' ? MISFIRE : Math.min(SLOW, react) + PENALTY * falses;
+    rounds.push({ ms, react, falses, outcome });
+    total += ms;
+    lastReact = react;
+    setPhase('result');
+    const o = opp();
+    const won = outcome === 'hit' && react < o.ms;
+    if (outcome === 'hit') {
+      you.armTo = 1; you.arm = 1; you.muzzle = MUZZLE; sfx.shot(-0.4); hitStop = 0.07; shake = 8;
+      sparks(true);
+    }
+    if (won) {
+      foe.falling = true; sfx.ricochet(); sfx.win();
+      foe.armTo = 0.35;
+    } else {
+      // the outlaw clears leather first (or you never fired)
+      foe.armTo = 1; foe.arm = 1; foe.muzzle = MUZZLE; you.falling = outcome !== 'misfire';
+      if (outcome !== 'hit') sfx.shot(0.4); else setTimeout(() => sfx.shot(0.4), 60);
+      sparks(false); sfx.lose();
+      flash = Math.max(flash, 0.5); flashRGB = '244,63,94';
+    }
+    for (let i = 0; i < 14; i++) dust(won ? W * 0.76 : W * 0.24);
+    if (rounds.length === ROUNDS && !reported) {
+      reported = true;
+      newBest = best === null || total < best;
+      best = best === null ? total : Math.min(best, total);
+      IC.gameOver(total);
+    }
+  }
+
+  function press(evT) {
+    if (mode !== 'play' || paused) return;
+    if (phase === 'steady') { falseStart('early'); return; }
+    if (phase !== 'draw') return;
+    const r = evT - drawAt;
+    if (r < 0) falseStart('early');
+    else if (r < ANTICIPATE) falseStart('guess');
+    else resolve(Math.round(r), 'hit');
+  }
+
+  // ---------------------------------------------------------------- effects
+  function sparks(mine) {
+    const p = gunTip(mine ? you : foe, mine ? 1 : -1);
+    for (let i = 0; i < 22; i++) {
+      const a = (mine ? 0 : Math.PI) + rnd(-0.5, 0.5), sp = rnd(150, 700) * U;
+      parts.push({ x: p[0], y: p[1], vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0, max: rnd(0.15, 0.45), hue: rnd(28, 50), r: rnd(1, 3) * U * 1.4 });
+    }
+  }
+  function dust(x) {
+    parts.push({ x: x + rnd(-40, 40) * U, y: groundY, vx: rnd(-80, 80) * U, vy: -rnd(20, 120) * U, life: 0, max: rnd(0.6, 1.2), hue: 20, r: rnd(3, 8) * U, dust: true });
+  }
+  function updateFx(dt) {
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i]; p.life += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+      if (p.dust) { p.vy += 30 * U * dt; p.vx *= 1 - dt; } else p.vy += 900 * U * dt;
+      if (p.life > p.max) parts.splice(i, 1);
+    }
+    for (const f of [you, foe]) {
+      f.arm += (f.armTo - f.arm) * Math.min(1, dt * 22);
+      if (f.falling) f.fall = Math.min(1, f.fall + dt * 2.2);
+      f.muzzle = Math.max(0, f.muzzle - dt);
+    }
+    // the odd tumbleweed rolls through
+    if (weeds.length < 1 && Math.random() < dt * 0.08) weeds.push({ x: -0.1, sp: rnd(0.06, 0.12), r: rnd(0.025, 0.04), a: 0 });
+    for (let i = weeds.length - 1; i >= 0; i--) { const w = weeds[i]; w.x += w.sp * dt; w.a += w.sp * dt / w.r; if (w.x > 1.15) weeds.splice(i, 1); }
+    shake = Math.max(0, shake - dt * 45);
+    flash = Math.max(0, flash - dt * 3);
+  }
+
+  // ---------------------------------------------------------------- input
+  const canRestart = () => mode === 'attract' || (mode === 'over' && overT > 1);
+  window.addEventListener('keydown', (e) => {
+    audio();
+    if (e.code === 'KeyM') { if (!e.repeat) setMuted(!muted); return; }
+    if (e.repeat || e.metaKey || e.ctrlKey || e.altKey || e.code === 'Tab' || e.key === 'Shift') return;
+    e.preventDefault();
+    if (mode === 'play') {
+      if (paused) { resume(); return; }
+      if (e.code === 'Escape' || e.code === 'KeyP') { if (phase !== 'draw') pause(); return; }
+      press(e.timeStamp);
+    } else if ((e.code === 'Enter' || e.code === 'Space') && IC.standalone && canRestart()) newRun();
+  });
+  cv.addEventListener('pointerdown', (e) => {
+    audio(); cv.focus(); e.preventDefault();
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (mode === 'play') { if (paused) resume(); else press(e.timeStamp); }
+    else if (IC.standalone && canRestart()) newRun();
+  });
+  cv.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  function pause() {
+    paused = true;
+    // a hidden wait or draw is void: the round restarts on return, no penalty
+    if (phase === 'steady' || phase === 'draw') { setPhase('intro'); phaseAt = clock - 0.9; resetFigures(); }
+    windLevel(0.03);
+  }
+  function resume() { paused = false; windLevel(0.05); }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && mode === 'play' && !paused) pause();
+    last = performance.now();
+  });
+  window.addEventListener('resize', layout);
+  IC.on('start', () => newRun());
+
+  // ---------------------------------------------------------------- update
+  function update(dt, now) {
+    if (mode === 'play' && !paused) {
+      clock += dt;
+      const pt = clock - phaseAt;
+      if (phase === 'intro' && pt > 1.4) enterSteady();
+      else if (phase === 'steady') {
+        if (clock >= nextTick) { sfx.tick(tickN % 2); if (tickN % 2 === 0) sfx.heart(); tickN++; nextTick += 0.5; }
+        if (clock >= drawClock) enterDraw(now);
+      } else if (phase === 'draw') {
+        if (now - drawAt > SLOW) resolve(SLOW, 'slow');
+      } else if (phase === 'false' && pt > 1.35) {
+        if (falses >= MAX_FALSES) resolve(SLOW, 'misfire');
+        else enterSteady();
+      } else if (phase === 'result' && pt > 1.9) {
+        round++;
+        if (round >= ROUNDS) { mode = 'over'; overT = 0; sfx.finale(); windLevel(0.05); }
+        else startRound();
+      }
+    } else if (mode === 'over') overT += dt;
+    updateFx(dt);
+  }
+
+  // ---------------------------------------------------------------- drawing
+  function figureBase(isYou) {
+    const fh = Math.min(H * (W / H < 1 ? 0.26 : 0.34), W * 0.28);
+    return { x: W * (isYou ? 0.22 : 0.78), y: groundY + fh * 0.02, s: fh, f: isYou ? 1 : -1 };
+  }
+  function armAngle(fig) { return (1 - fig.arm) * 1.25; } // radians below horizontal
+  function gunTip(fig, f) {
+    const b = figureBase(f === 1), s = b.s, a = armAngle(fig);
+    const shx = b.x + 0.07 * s * f, shy = b.y - 0.72 * s;
+    const L = 0.36 * s;
+    return [shx + Math.cos(a) * L * f, shy + Math.sin(a) * L];
+  }
+
+  function drawFigure(fig, isYou, color, glow) {
+    const b = figureBase(isYou), s = b.s, f = b.f;
+    g.save();
+    g.translate(b.x, b.y);
+    if (fig.fall > 0) { const k = ease(fig.fall); g.rotate(-f * k * 1.45); g.globalAlpha = 1 - k * 0.45; }
+    g.scale(f, 1);
+    g.lineJoin = 'round'; g.lineCap = 'round';
+    g.strokeStyle = color; g.fillStyle = '#1a0820'; g.lineWidth = Math.max(1.5, s * 0.018);
+    g.shadowColor = glow; g.shadowBlur = s * 0.06;
+    const path = () => {
+      g.beginPath();
+      // legs
+      g.moveTo(-0.08 * s, 0); g.lineTo(-0.05 * s, -0.42 * s); g.lineTo(0.05 * s, -0.42 * s); g.lineTo(0.08 * s, 0);
+      g.lineTo(0.03 * s, 0); g.lineTo(0, -0.3 * s); g.lineTo(-0.03 * s, 0); g.closePath();
+      // duster coat
+      g.moveTo(-0.13 * s, -0.36 * s); g.lineTo(-0.09 * s, -0.76 * s); g.quadraticCurveTo(0, -0.8 * s, 0.09 * s, -0.76 * s);
+      g.lineTo(0.12 * s, -0.4 * s); g.lineTo(0.02 * s, -0.43 * s); g.closePath();
+      // head
+      g.moveTo(0.075 * s, -0.85 * s); g.arc(0, -0.85 * s, 0.075 * s, 0, 6.283);
+      // hat: brim + crown
+      g.moveTo(-0.17 * s, -0.9 * s); g.quadraticCurveTo(0, -0.95 * s, 0.17 * s, -0.9 * s); g.quadraticCurveTo(0, -0.88 * s, -0.17 * s, -0.9 * s);
+      g.moveTo(-0.08 * s, -0.915 * s); g.lineTo(-0.065 * s, -1.02 * s); g.quadraticCurveTo(0, -0.99 * s, 0.065 * s, -1.02 * s); g.lineTo(0.08 * s, -0.915 * s); g.closePath();
+    };
+    path(); g.fill(); g.stroke();
+    g.shadowBlur = 0;
+    // back arm hangs loose
+    g.lineWidth = s * 0.04; g.strokeStyle = '#1a0820';
+    g.beginPath(); g.moveTo(-0.07 * s, -0.72 * s); g.lineTo(-0.11 * s, -0.47 * s); g.stroke();
+    g.lineWidth = Math.max(1.5, s * 0.018); g.strokeStyle = color;
+    g.beginPath(); g.moveTo(-0.07 * s, -0.72 * s); g.lineTo(-0.11 * s, -0.47 * s); g.stroke();
+    // gun arm: swings from the holster up to aim
+    const a = armAngle(fig), shx = 0.07 * s, shy = -0.72 * s, L = 0.36 * s;
+    const hx = shx + Math.cos(a) * L * 0.86, hy = shy + Math.sin(a) * L * 0.86;
+    g.shadowColor = glow; g.shadowBlur = s * 0.05;
+    g.lineWidth = s * 0.045; g.strokeStyle = '#1a0820';
+    g.beginPath(); g.moveTo(shx, shy); g.lineTo(hx, hy); g.stroke();
+    g.lineWidth = Math.max(1.5, s * 0.018); g.strokeStyle = color;
+    g.beginPath(); g.moveTo(shx, shy); g.lineTo(hx, hy); g.stroke();
+    // the revolver
+    g.save(); g.translate(hx, hy); g.rotate(a);
+    g.fillStyle = color;
+    g.fillRect(0, -0.012 * s, 0.13 * s, 0.024 * s);
+    g.fillRect(-0.005 * s, -0.01 * s, 0.03 * s, 0.06 * s);
+    g.restore();
+    // badge / scarf accent
+    g.shadowBlur = 0; g.fillStyle = color;
+    g.beginPath(); g.arc(0.03 * s, -0.66 * s, 0.014 * s, 0, 6.283); g.fill();
+    g.restore();
+    // muzzle flash
+    if (fig.muzzle > 0) {
+      const p = gunTip(fig, f), k = fig.muzzle / MUZZLE, r = s * 0.16 * (0.6 + k);
+      g.save(); g.globalCompositeOperation = 'lighter';
+      // bullet tracer towards the other duellist's chest
+      const o = figureBase(!isYou), tx = o.x, ty = o.y - o.s * 0.62;
+      const tg = g.createLinearGradient(p[0], p[1], tx, ty);
+      tg.addColorStop(0, `rgba(255,251,235,${k})`); tg.addColorStop(1, 'rgba(251,146,60,0)');
+      g.strokeStyle = tg; g.lineWidth = Math.max(1.5, s * 0.012 * k); g.lineCap = 'round';
+      g.beginPath(); g.moveTo(p[0], p[1]); g.lineTo(p[0] + (tx - p[0]) * Math.min(1, (1 - k) * 4 + 0.3), p[1] + (ty - p[1]) * Math.min(1, (1 - k) * 4 + 0.3)); g.stroke();
+      const mg = g.createRadialGradient(p[0], p[1], 0, p[0], p[1], r);
+      mg.addColorStop(0, `rgba(255,255,230,${k})`); mg.addColorStop(0.3, `rgba(253,186,116,${k * 0.9})`); mg.addColorStop(1, 'rgba(249,115,22,0)');
+      g.fillStyle = mg; g.beginPath(); g.arc(p[0], p[1], r, 0, 6.283); g.fill(); g.restore();
+    }
+  }
+
+  function drawWeeds() {
+    g.save(); g.strokeStyle = 'rgba(120,53,15,0.85)'; g.lineWidth = Math.max(1, U * 1.6);
+    for (const w of weeds) {
+      const r = w.r * Math.min(W, H * 1.6), x = w.x * W, y = groundY - r + Math.abs(Math.sin(w.a * 2)) * -r * 0.3;
+      g.save(); g.translate(x, y); g.rotate(w.a);
+      for (let i = 0; i < 5; i++) { g.beginPath(); g.ellipse(0, 0, r, r * 0.55, i * 0.63, 0, 6.283); g.stroke(); }
+      g.restore();
+    }
+    g.restore();
+  }
+
+  function text(str, x, y, size, color, o = {}) {
+    g.font = `${o.weight || 800} ${size}px ${o.mono ? MONO : FONT}`;
+    g.textAlign = o.align || 'center'; g.textBaseline = 'middle';
+    if (o.glow) { g.save(); g.shadowColor = o.glow; g.shadowBlur = size * 0.4; g.fillStyle = color; g.fillText(str, x, y); g.restore(); }
+    if (o.outline) { g.lineWidth = size * 0.12; g.strokeStyle = o.outline; g.strokeText(str, x, y); }
+    g.fillStyle = color; g.fillText(str, x, y);
+  }
+
+  function drawHud() {
+    const m = clamp(Math.min(W, H) * 0.03, 10, 28), fs = clamp(Math.min(W * 0.035, H * 0.045), 13, 26);
+    const y1 = m + fs * 0.35, y2 = m + fs * 1.25;
+    text('ROUND', m, y1, fs * 0.5, 'rgba(253,186,116,0.75)', { align: 'left', mono: true, weight: 600 });
+    text(mode === 'attract' ? '-/5' : `${Math.min(round + 1, ROUNDS)}/${ROUNDS}`, m, y2, fs, '#fef3c7', { align: 'left', mono: true });
+    text('TOTAL', W / 2, y1, fs * 0.5, 'rgba(253,186,116,0.75)', { mono: true, weight: 600 });
+    text(mode === 'attract' ? '-' : total + ' ms', W / 2, y2, fs, '#fde68a', { mono: true });
+    text('BEST', W - m, y1, fs * 0.5, 'rgba(253,186,116,0.75)', { align: 'right', mono: true, weight: 600 });
+    text(best === null ? '-' : best + ' ms', W - m, y2, fs, '#fb923c', { align: 'right', mono: true });
+    if (muted) text('SOUND OFF · M', W - m, y2 + fs * 0.95, fs * 0.42, 'rgba(254,243,199,0.45)', { align: 'right', mono: true, weight: 600 });
+  }
+
+  // the five round cards along the bottom
+  function drawRounds() {
+    if (mode === 'attract') return;
+    const n = ROUNDS, gap = clamp(W * 0.012, 4, 14);
+    const cw = Math.min((W - gap * (n + 3)) / n, 170), ch = clamp(cw * 0.55, 34, 76);
+    const x0 = (W - (cw * n + gap * (n - 1))) / 2, y = H - ch - clamp(H * 0.03, 8, 26);
+    for (let i = 0; i < n; i++) {
+      const x = x0 + i * (cw + gap), r = rounds[i], cur = mode === 'play' && i === round && !r;
+      g.save();
+      g.beginPath(); g.roundRect ? g.roundRect(x, y, cw, ch, ch * 0.22) : g.rect(x, y, cw, ch);
+      g.fillStyle = r ? (r.outcome === 'misfire' ? 'rgba(76,5,25,0.85)' : 'rgba(67,20,7,0.8)') : 'rgba(30,8,36,0.75)';
+      g.fill();
+      g.lineWidth = cur ? 2 : 1;
+      g.strokeStyle = cur ? `rgba(251,191,36,${0.55 + 0.45 * Math.sin(time * 5)})` : r ? 'rgba(251,146,60,0.6)' : 'rgba(251,146,60,0.22)';
+      g.stroke(); g.restore();
+      const fs = ch * 0.36;
+      if (r) {
+        text(r.ms + '', x + cw / 2, y + ch * 0.42, fs, r.outcome === 'misfire' ? '#fda4af' : '#fef3c7', { mono: true });
+        const lbl = r.outcome === 'misfire' ? 'MISFIRE' : r.outcome === 'slow' ? 'TOO SLOW' : r.falses ? `${r.react} +${r.falses * PENALTY}` : 'ms';
+        text(lbl, x + cw / 2, y + ch * 0.77, fs * 0.48, r.falses || r.outcome !== 'hit' ? '#fb7185' : 'rgba(253,186,116,0.8)', { mono: true, weight: 600 });
+      } else {
+        text(cur && falses ? `+${falses * PENALTY}` : String(i + 1), x + cw / 2, y + ch * 0.5, fs * (cur && falses ? 0.8 : 0.9), cur && falses ? '#fb7185' : 'rgba(253,186,116,0.4)', { mono: true });
+      }
+    }
+  }
+
+  function drawCenter() {
+    const big = Math.min(W * 0.16, H * 0.2), cy = H * (W / H < 1 ? 0.3 : 0.34);
+    const pt = clock - phaseAt;
+    if (mode === 'attract') {
+      const bob = reduced ? 0 : Math.sin(time * 1.6) * big * 0.03;
+      text('QUICKDRAW', W / 2, cy - big * 0.35 + bob, big * 0.72, '#fef3c7', { glow: '#f97316', weight: 900 });
+      text('Five outlaws. One second each. Don\'t flinch.', W / 2, cy + big * 0.22, big * 0.17, '#fdba74', { weight: 600, outline: 'rgba(26,8,32,0.8)' });
+      g.globalAlpha = 0.55 + 0.45 * Math.sin(time * 4);
+      const cta = IC.standalone ? (coarse ? 'TAP TO START' : 'PRESS ENTER TO START') : 'PRESS START';
+      text(cta, W / 2, cy + big * 0.55, big * 0.2, '#fde68a', { glow: '#ea580c' });
+      g.globalAlpha = 1;
+      const hint = coarse ? 'Wait for DRAW!, then tap anywhere · jump early = +500 ms'
+        : 'Wait for DRAW!, then press Space or click · jump early = +500 ms · M mutes';
+      text(hint, W / 2, cy + big * 0.85, big * 0.12, 'rgba(254,243,199,0.8)', { weight: 500, outline: 'rgba(26,8,32,0.7)' });
+      return;
+    }
+    if (mode === 'over') {
+      const e = ease(overT * 2);
+      g.globalAlpha = e;
+      const y = cy - big * 0.1 + (1 - e) * big * 0.3;
+      text('SHOWDOWN OVER', W / 2, y - big * 0.55, big * 0.28, '#fdba74', { weight: 800 });
+      text(total + ' ms', W / 2, y + big * 0.05, big * 0.62, '#fef3c7', { glow: '#f97316', mono: true, weight: 900 });
+      text(newBest ? 'NEW BEST!  ·  ' + rating(total) : rating(total) + '  ·  best ' + best + ' ms', W / 2, y + big * 0.55, big * 0.17, '#fde68a', { weight: 700 });
+      if (overT > 1) {
+        g.globalAlpha = e * (0.55 + 0.45 * Math.sin(time * 4));
+        text(IC.standalone ? (coarse ? 'Tap to duel again' : 'Press Enter to duel again') : 'Press start to duel again', W / 2, y + big * 0.85, big * 0.15, '#fef3c7', { weight: 700 });
+      }
+      g.globalAlpha = 1;
+      return;
+    }
+    if (paused) {
+      g.save(); g.fillStyle = 'rgba(18,5,26,0.7)'; g.fillRect(0, 0, W, H); g.restore();
+      text('PAUSED', W / 2, cy, big * 0.5, '#fef3c7', { glow: '#f97316' });
+      text(coarse ? 'Tap to continue' : 'Press any key to continue', W / 2, cy + big * 0.45, big * 0.16, '#fdba74', { weight: 600 });
+      return;
+    }
+    const o = opp();
+    if (phase === 'intro') {
+      const k = ease(pt * 3);
+      g.globalAlpha = Math.min(1, pt * 4) * (pt > 1.15 ? Math.max(0, 1 - (pt - 1.15) * 4) : 1);
+      text(`ROUND ${round + 1}`, W / 2, cy - big * 0.3, big * 0.24, '#fdba74', { weight: 700 });
+      text(o.name.toUpperCase(), W / 2 + (1 - k) * W * 0.1, cy + big * 0.08, big * 0.42, '#fef3c7', { glow: `hsl(${o.hue},90%,60%)`, weight: 900 });
+      text(`draws in ${o.ms} ms`, W / 2, cy + big * 0.42, big * 0.14, 'rgba(254,243,199,0.7)', { weight: 600, mono: true });
+      g.globalAlpha = 1;
+    } else if (phase === 'steady') {
+      const beat = 1 + 0.06 * Math.max(0, 1 - ((clock - nextTick + 0.5) * 6));
+      text('STEADY…', W / 2, cy, big * 0.42 * beat, '#fde68a', { weight: 800, outline: 'rgba(26,8,32,0.75)' });
+      text(coarse ? 'hold still' : 'hands off the trigger', W / 2, cy + big * 0.4, big * 0.13, 'rgba(254,243,199,0.7)', { weight: 600, outline: 'rgba(26,8,32,0.7)' });
+    } else if (phase === 'draw') {
+      const s = 1 + 0.15 * Math.max(0, 1 - pt * 8);
+      text('DRAW!', W / 2, cy, big * 0.95 * s, '#ffffff', { glow: '#fbbf24', weight: 900, outline: '#9a3412' });
+    } else if (phase === 'false') {
+      const lost = falses >= MAX_FALSES;
+      text(lost ? 'MISFIRE!' : 'FALSE START', W / 2, cy - big * 0.2, big * 0.42, '#fda4af', { glow: '#e11d48', weight: 900 });
+      text(lost ? `round lost · ${MISFIRE} ms` : `+${PENALTY} ms penalty`, W / 2, cy + big * 0.22, big * 0.24, '#fecdd3', { weight: 800, mono: true });
+      text(lastKind === 'guess' ? 'that was a guess, not a reaction' : lost ? 'three jumps and you\'re out' : `false starts this round: ${falses}/${MAX_FALSES - 1}`, W / 2, cy + big * 0.52, big * 0.12, 'rgba(254,205,211,0.7)', { weight: 600 });
+    } else if (phase === 'result') {
+      const r = rounds[rounds.length - 1];
+      const shown = r.outcome === 'hit' ? Math.round(r.react * ease(pt * 3.5)) : 0;
+      const won = r.outcome === 'hit' && r.react < o.ms;
+      if (r.outcome === 'hit') {
+        text(shown + ' ms', W / 2, cy - big * 0.05, big * 0.62, '#fef3c7', { glow: '#f97316', mono: true, weight: 900 });
+        text(won ? (r.react < 200 ? 'LIGHTNING!' : 'YOU OUTDREW ' + o.name.toUpperCase()) : 'OUTDRAWN BY ' + o.ms + ' ms', W / 2, cy + big * 0.45, big * 0.17, won ? '#fde68a' : '#fda4af', { weight: 800 });
+        if (r.falses) text(`+${r.falses * PENALTY} ms false-start penalty → ${r.ms} ms`, W / 2, cy + big * 0.72, big * 0.12, '#fb7185', { weight: 700, mono: true });
+      } else {
+        text(r.outcome === 'slow' ? 'TOO SLOW' : 'MISFIRE', W / 2, cy - big * 0.05, big * 0.5, '#fda4af', { glow: '#e11d48', weight: 900 });
+        text(`${r.ms} ms`, W / 2, cy + big * 0.42, big * 0.2, '#fecdd3', { weight: 800, mono: true });
+      }
+    }
+  }
+
+  function rating(t) {
+    const avg = t / ROUNDS;
+    if (avg < 220) return 'Lightning Hands';
+    if (avg < 280) return 'Gunslinger';
+    if (avg < 360) return 'Deputy';
+    if (avg < 500) return 'Greenhorn';
+    return 'Tumbleweed';
+  }
+
+  function render() {
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const sk = shake * (reduced ? 0.15 : 1);
+    g.save();
+    if (sk > 0.05) g.translate(rnd(-sk, sk), rnd(-sk, sk));
+    // a slow push-in while the duellists wait
+    const zoom = mode === 'play' && phase === 'steady' && !reduced ? 1 + Math.min(0.05, (clock - phaseAt) * 0.012) : 1;
+    if (zoom !== 1) { g.translate(W / 2, groundY); g.scale(zoom, zoom); g.translate(-W / 2, -groundY); }
+    g.drawImage(bg, 0, 0, W, H);
+    // stars twinkle
+    for (const s of stars) {
+      g.fillStyle = `rgba(254,243,199,${0.25 + 0.35 * Math.sin(time * 1.5 + s.p) ** 2})`;
+      g.fillRect(s.x * W, s.y * groundY, s.r, s.r);
+    }
+    drawWeeds();
+    const o = opp();
+    drawFigure(you, true, '#fbbf24', 'rgba(251,191,36,0.9)');
+    drawFigure(foe, false, `hsl(${mode === 'attract' ? 18 : o.hue},90%,64%)`, `hsla(${mode === 'attract' ? 18 : o.hue},90%,60%,0.9)`);
+    // particles
+    g.save(); g.globalCompositeOperation = 'lighter';
+    for (const p of parts) {
+      const k = 1 - p.life / p.max;
+      g.fillStyle = p.dust ? `rgba(180,83,9,${k * 0.35})` : `hsla(${p.hue},100%,${60 + 30 * k}%,${k})`;
+      g.beginPath(); g.arc(p.x, p.y, p.r * (p.dust ? 2 - k : 1), 0, 6.283); g.fill();
+    }
+    g.restore();
+    g.restore();
+    // vignette tightens while you wait
+    const tense = mode === 'play' && phase === 'steady' ? Math.min(1, (clock - phaseAt) / 3) : 0;
+    const vg = g.createRadialGradient(W / 2, H * 0.5, Math.min(W, H) * (0.45 - tense * 0.15), W / 2, H * 0.5, Math.max(W, H) * 0.75);
+    vg.addColorStop(0, 'rgba(10,2,14,0)'); vg.addColorStop(1, `rgba(10,2,14,${0.55 + tense * 0.3})`);
+    g.fillStyle = vg; g.fillRect(0, 0, W, H);
+    // the game-over veil sits under the HUD so the round breakdown stays readable
+    if (mode === 'over') { g.save(); g.globalAlpha = 0.72 * ease(overT * 2); g.fillStyle = '#12051a'; g.fillRect(0, 0, W, H); g.restore(); }
+    drawHud();
+    drawRounds();
+    drawCenter();
+    if (flash > 0) {
+      g.fillStyle = `rgba(${flashRGB},${(reduced ? 0.15 : 0.55) * flash})`;
+      g.fillRect(0, 0, W, H);
+    }
+  }
+
+  // ---------------------------------------------------------------- loop
+  let last = performance.now();
+  function frame(now) {
+    const dt = clamp((now - last) / 1000, 0, 0.05); last = now;
+    time += dt;
+    if (hitStop > 0) hitStop -= dt;
+    else update(dt, now);
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  layout();
+  requestAnimationFrame((t) => { last = t; frame(t); });
+  IC.ready();
+})();
+</script>
+</body>
+</html>
